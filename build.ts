@@ -11,9 +11,9 @@ const BASES = {
     'x64': 'qwin.exe',                      // x64 全功能
     'x64-nowasm': 'qwin-nowasm.exe',        // x64、体积次小（Vista+）
     'x86': 'qwin-x86.exe',                  // 32 位 + WebAssembly
-    'x86-nowasm': 'qwin-nowasm-x86.exe',    // 32 位、体积最小、XP 可跑，只缺 WebAssembly.*（默认）
+    'x86-nowasm': 'qwin-nowasm-x86.exe',    // 32 位、体积最小、XP 可跑，只缺 WebAssembly.*
 } as const
-const DEFAULT_BASE = 'x86-nowasm'
+const DEFAULT_BASE = 'x64-nowasm'   // 默认 x64（Vista+，体积次小）；winsqlite3.dll 读库用 64 位 FFI
 const ENTRY = 'src/main.tsx'
 const ENTRY_LIVE = 'src/entry.ts'     // live 版入口：只 import(main.tsx)，rolldown 据此拆 chunk
 const OUT_JS = 'dist/app.js'
