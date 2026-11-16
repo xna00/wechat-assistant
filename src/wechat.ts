@@ -164,13 +164,18 @@ function contactsContainer(c: UiaClient, hwnd: MaybePtr<'HWND'>): UiaElement | n
     }
 }
 
-/** WM_MOUSEWHEEL 滚通讯录列表（delta>0 向上，<0 向下；命中列表中心屏幕坐标，后台不抢焦点） */
-function wheelContacts(hwnd: MaybePtr<'HWND'>, listRect: Rect, delta: number): void {
+/** WM_MOUSEWHEEL 滚列表（delta>0 向上，<0 向下；命中 rect 中心屏幕坐标，后台不抢焦点） */
+function wheelScroll(hwnd: MaybePtr<'HWND'>, listRect: Rect, delta: number): void {
     const cx = Math.round((listRect.left + listRect.right) / 2)
     const cy = Math.round((listRect.top + listRect.bottom) / 2)
     const wp = ((delta & 0xffff) << 16) >>> 0
     const lp = ((cy << 16) | (cx & 0xffff)) >>> 0
     PostMessage(hwnd, WM_MOUSEWHEEL, wp, lp)
+}
+
+/** WM_MOUSEWHEEL 滚通讯录列表（delta>0 向上，<0 向下；命中列表中心屏幕坐标，后台不抢焦点） */
+function wheelContacts(hwnd: MaybePtr<'HWND'>, listRect: Rect, delta: number): void {
+    wheelScroll(hwnd, listRect, delta)
 }
 
 /** 当前可视联系人 cell（name + 屏幕 rect），只在通讯录容器子树内枚举。 */
@@ -480,9 +485,210 @@ async function openSessionInList(hwnd: MaybePtr<'HWND'>, session: string): Promi
  *  返回 sent / not-found（搜索无此会话）/ failed（UI 操作失败）。 */
 export type SendResult = 'sent' | 'not-found' | 'failed'
 export async function sendToSession(hwnd: MaybePtr<'HWND'>, session: string, message: string): Promise<SendResult> {
-    if (!(await openSessionInList(hwnd, session))) {
-        const opened = await searchAndOpen(hwnd, session)
-        if (opened !== 'opened') return opened
-    }
+    const opened = await openSession(hwnd, session)
+    if (opened !== 'opened') return opened
     return (await sendMessage(hwnd, message)) ? 'sent' : 'failed'
+}
+
+// ── 读消息 ──
+// 消息在 mmui::RecyclerListView（name="消息"）里：ChatTextItemView.name=文本，
+// ChatItemView.name=时间分隔。方向（in/out）不在 UIA 树，用截图像素测气泡左右：
+// 左=别人(in)、右=自己(out)。
+export type ChatMessage = { direction: 'out' | 'in'; text: string; time: string | null }
+
+/** 打开会话（列表快路径 + 搜索兜底）；sendToSession / readMessages 共用。 */
+export async function openSession(hwnd: MaybePtr<'HWND'>, session: string): Promise<OpenResult> {
+    if (await openSessionInList(hwnd, session)) return 'opened'
+    return await searchAndOpen(hwnd, session)
+}
+
+/** 消息列表容器（RecyclerListView name="消息"）；调用方负责 release。找不到 → null。 */
+function messageList(c: UiaClient, hwnd: MaybePtr<'HWND'>): UiaElement | null {
+    const root = c.elementFromHandle(hwnd)
+    if (!root) return null
+    try {
+        return findFirst(root, (e: UiaElement) =>
+            e.className() === 'mmui::RecyclerListView' && e.name().trim() === '消息')
+    } finally {
+        root.release()
+    }
+}
+
+/** 当前可视消息项（顶→底）：kind='msg'（ChatTextItemView）| 'time'（ChatItemView 分隔符）。 */
+function visibleMessages(list: UiaElement): { kind: 'msg' | 'time'; text: string; rect: Rect }[] {
+    const items: { kind: 'msg' | 'time'; text: string; rect: Rect }[] = []
+    for (const el of list.findAllWhere(TreeScope.Subtree, (e: UiaElement) =>
+        e.className() === 'mmui::ChatTextItemView' || e.className() === 'mmui::ChatItemView')) {
+        const t = (el.name() || '').trim()
+        const r = el.rect()
+        if (t && r) {
+            items.push({
+                kind: el.className() === 'mmui::ChatItemView' ? 'time' : 'msg',
+                text: t,
+                rect: { left: r.left, top: r.top, right: r.right, bottom: r.bottom },
+            })
+        }
+        el.release()
+    }
+    return items.sort((a, b) => a.rect.top - b.rect.top)   // 顶→底
+}
+
+/** 窗口左上角（屏幕坐标）。 */
+function windowOrigin(hwnd: MaybePtr<'HWND'>): { x: number; y: number } {
+    const wr = RECT.alloc()
+    GetWindowRect(hwnd, wr.ptr)
+    const r = RECT.decode(wr)
+    return { x: r.left, y: r.top }
+}
+
+/** 由截图 + 行 rect 判方向：统计行内非背景像素左右分布（裁剪到列表可见区），右多=out，左多=in。
+ *  direction=null 表示样本不可用（行大部分在视口外 / 无足够内容），调用方应跳过该行留待重试。
+ *  viewport 为消息列表可见区（屏幕坐标），null=不裁剪（调用方已确认行完整可见时可不传）。 */
+function directionFromPixels(cap: { bmp: Uint8Array; width: number; height: number }, win: { x: number; y: number }, rect: Rect, viewport: Rect | null): { direction: 'out' | 'in' | null; content: number } {
+    const BMP_HDR = 54                       // BITMAPFILEHEADER + BITMAPINFOHEADER
+    const st = (w: number) => (w * 3 + 3) & ~3
+    const { bmp, width, height } = cap
+    let x0 = Math.round(rect.left - win.x), y0 = Math.round(rect.top - win.y)
+    let x1 = Math.round(rect.right - win.x), y1 = Math.round(rect.bottom - win.y)
+    const fullH = y1 - y0
+    if (viewport) {                          // 裁剪到列表可见区（避免采样被视口裁掉的部分）
+        const vx0 = Math.round(viewport.left - win.x), vy0 = Math.round(viewport.top - win.y)
+        const vx1 = Math.round(viewport.right - win.x), vy1 = Math.round(viewport.bottom - win.y)
+        x0 = Math.max(x0, vx0); y0 = Math.max(y0, vy0)
+        x1 = Math.min(x1, vx1); y1 = Math.min(y1, vy1)
+    }
+    const clipH = y1 - y0
+    if (clipH < fullH * 0.8 || x1 - x0 < 60) return { direction: null, content: 0 }   // 行大部分被视口裁掉
+    const mid = (x0 + x1) / 2
+    const px = (x: number, y: number): [number, number, number] => {
+        const xx = Math.max(0, Math.min(width - 1, Math.round(x)))
+        const yy = Math.max(0, Math.min(height - 1, Math.round(y)))
+        const o = BMP_HDR + yy * st(width) + xx * 3
+        return [bmp[o], bmp[o + 1], bmp[o + 2]]   // BGR
+    }
+    // 背景参考取行左缘（in 气泡在头像后 ~56px 起，左缘是背景；out 气泡在右侧）
+    const bg = px(x0 + 3, (y0 + y1) / 2)
+    let L = 0, R = 0
+    for (let y = y0 + 4; y < y1 - 4; y += 2) {
+        for (let x = x0 + 4; x < x1 - 4; x += 2) {
+            const p = px(x, y)
+            const d = Math.abs(p[0] - bg[0]) + Math.abs(p[1] - bg[1]) + Math.abs(p[2] - bg[2])
+            if (d > 80) { if (x < mid) L++; else R++ }
+        }
+    }
+    const content = L + R
+    if (content < 50) return { direction: null, content }   // 无足够内容，样本不可用
+    return { direction: R > L ? 'out' : 'in', content }
+}
+
+/** 读消息结果：ok 携带消息（数组末尾=最新）；失败区分会话不存在（404）与其他 UI 失败（500）。 */
+export type ReadMessagesResult =
+    | { ok: true; messages: ChatMessage[] }
+    | { ok: false; reason: 'not-found' | 'failed' }
+
+/** 当前可视消息项集合指纹（文本|top）。 */
+function visibleKey(list: UiaElement): Set<string> {
+    return new Set(visibleMessages(list).map(x => x.text + '|' + Math.round(x.rect.top)))
+}
+
+/** 等待消息列表稳定（连续两次读数一致，~180ms 间隔）；消除滚动动画造成的捕获/UIA 竞态。
+ *  超时（~2.2s）仍不稳 → false（调用方跳过本轮，下次再试）。 */
+async function waitStable(list: UiaElement): Promise<boolean> {
+    for (let i = 0; i < 12; i++) {
+        const a = visibleKey(list)
+        await delay(180)
+        const b = visibleKey(list)
+        if (a.size > 0 && a.size === b.size && [...a].every(k => b.has(k))) return true
+    }
+    return false
+}
+
+/** 读会话最近 limit 条消息（从底部往上收集，向上滚动补足）。
+ *  顺序：数组末尾是最新（顶→底）。 */
+export async function readMessages(hwnd: MaybePtr<'HWND'>, session: string, limit = 20): Promise<ReadMessagesResult> {
+    const opened = await openSession(hwnd, session)
+    if (opened === 'not-found') return { ok: false, reason: 'not-found' }
+    if (opened !== 'opened') return { ok: false, reason: 'failed' }
+    const c = uia()
+    if (!c) return { ok: false, reason: 'failed' }
+    const list = messageList(c, hwnd)
+    if (!list) return { ok: false, reason: 'failed' }
+    try {
+        const listRect = list.rect()
+        if (!listRect) return { ok: false, reason: 'failed' }
+        // 1) 滚到底（最新消息在底部）：向下滚直到集合稳定
+        {
+            let last = new Set<string>()
+            let stable = 0
+            for (let i = 0; i < 20; i++) {
+                wheelScroll(hwnd, listRect, -480)
+                wheelScroll(hwnd, listRect, -480)
+                wheelScroll(hwnd, listRect, -480)
+                await delay(120)
+                const cur = new Set(visibleMessages(list).map(x => x.text + '|' + x.rect.top))
+                if (cur.size > 0 && cur.size === last.size && [...cur].every(t => last.has(t))) {
+                    stable++
+                    if (stable >= 2) break
+                } else stable = 0
+                last = cur
+            }
+            await delay(300)
+        }
+        // 2) 从底向上收集（每步：等稳定 → 捕获 → 裁剪到视口判方向）。
+        //    先顶→底扫描赋时间（分隔符更新当前组），再底→顶收集（最新先）。
+        //    行被视口裁剪 / 内容不足 → 跳过，留待后续步（该行完整可见时）再收。
+        //    去重按 text（稳定身份）：同一消息在不同滚动步可能被赋不同时间（时间组取决于
+        //    视口内可见分隔符），故按 text 合并、时间取非 null 优先，避免幻影重复。
+        //    【已知局限】相同 text 的不同真实消息会被合并丢失（UIA 近似，主路径够用；
+        //    精确/历史读用 /messages/db，无此问题）。
+        const collected = new Map<string, ChatMessage>()   // key=text，值=消息；最新在末尾插入
+        let prevVisible: Set<string> | null = null
+        for (let step = 0; step < 40 && collected.size < limit; step++) {
+            if (!(await waitStable(list))) continue            // 滚动中，跳过本轮
+            const items = visibleMessages(list)
+            const curVisible = new Set(items.map(x => x.text + '|' + Math.round(x.rect.top)))
+            const cap = captureWindow(hwnd)
+            if (!cap) break
+            const win = windowOrigin(hwnd)
+            // 顶→底赋时间
+            let curTime: string | null = null
+            const withTime: ({ text: string; time: string | null; rect: Rect })[] = []
+            for (const it of items) {
+                if (it.kind === 'time') { curTime = it.text; continue }
+                withTime.push({ text: it.text, time: curTime, rect: it.rect })
+            }
+            // 底→顶收集（最新先）：按 text 合并，时间取非 null 优先
+            let added = 0
+            for (let i = withTime.length - 1; i >= 0; i--) {
+                const m = withTime[i]
+                const d = directionFromPixels(cap, win, m.rect, listRect)
+                if (!d.direction) continue                     // 裁剪/内容不足 → 本轮跳过
+                const existing = collected.get(m.text)
+                if (existing) {
+                    if (existing.time === null && m.time !== null) collected.set(m.text, { ...existing, time: m.time })
+                    continue
+                }
+                collected.set(m.text, { direction: d.direction, text: m.text, time: m.time })
+                added++
+            }
+            if (added === 0) {
+                // 本轮无新消息；若可见集也没变 → 已到顶，停止
+                if (prevVisible && curVisible.size === prevVisible.size && [...curVisible].every(k => prevVisible!.has(k))) break
+                prevVisible = curVisible
+            } else {
+                prevVisible = curVisible
+            }
+            if (collected.size >= limit) break
+            // 向上滚一页；若无新消息且到顶则停
+            wheelScroll(hwnd, listRect, 480)
+            wheelScroll(hwnd, listRect, 480)
+            wheelScroll(hwnd, listRect, 480)
+            await delay(350)
+        }
+        // Map 插入序=首次收集序（最新在前）→ 取前 limit 条再反转成 顶→底，末尾最新
+        const messages = [...collected.values()].slice(0, limit).reverse()
+        return { ok: true, messages }
+    } finally {
+        list.release()
+    }
 }

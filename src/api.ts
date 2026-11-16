@@ -2,7 +2,8 @@
 // 自描述：其余任何请求返回 API 使用说明（见 API_DOC）。
 // 绑定 guest 本地 127.0.0.1:8123（VM 内部调用，不做宿主端口映射）。
 import { createServer } from 'quickwin/lib/http-server.js'
-import { findWeChatHwnd, openContacts, listContacts, listContactsWithAvatar, sendToSession } from './wechat.ts'
+import { findWeChatHwnd, openContacts, listContacts, listContactsWithAvatar, sendToSession, readMessages } from './wechat.ts'
+import { readMessagesDb } from './db.ts'
 
 const PORT = 8123
 
@@ -49,6 +50,31 @@ const API_DOC = {
                 { status: 503, error: 'wechat not running' },
                 { status: 404, error: 'session not found' },
                 { status: 500, error: 'send failed' },
+            ],
+        },
+        {
+            method: 'GET',
+            path: '/messages',
+            description: '读取会话最近 N 条消息（滚动到最新后从底部向上收集；方向由气泡左右位置判定，左=别人 in、右=自己 out；时间取最近的分隔标记）',
+            query: { session: '必填，会话名', limit: '可选，条数，默认 20，上限 200' },
+            response: { messages: [{ direction: 'out', text: 'hello', time: '12:45' }] },
+            errors: [
+                { status: 400, error: 'missing session' },
+                { status: 503, error: 'wechat not running' },
+                { status: 404, error: 'session not found' },
+                { status: 500, error: 'read failed' },
+            ],
+        },
+        {
+            method: 'GET',
+            path: '/messages/db',
+            description: '读库增强（混合方案）：从 SQLCipher4 加密库精确读取会话消息。方向/发送人精确（real_sender_id→Name2Id→user_name），支持完整历史分页（offset/limit）。低频调用；读库含 ToS/法律风险，仅作精确校验/历史导出，勿高频。',
+            query: { session: '必填，会话名（显示名或 user_name，如 filehelper/谢/wxid_...）', limit: '可选，条数，默认 20，上限 200', offset: '可选，偏移（从最新往回），默认 0' },
+            response: { messages: [{ direction: 'out', text: 'hello', time: 1794806346, sender: 'wxid_jfxzqjzuqz0322' }], total: 37 },
+            errors: [
+                { status: 400, error: 'missing session' },
+                { status: 404, error: 'session not found' },
+                { status: 500, error: 'read failed' },
             ],
         },
     ],
@@ -149,10 +175,59 @@ export function startApiServer(): number {
                 return json({ ok: false, error: 'send failed' }, 500)
             })
         }
+        if (req.method === 'GET' && path === '/messages') {
+            return await withUiLock(async () => {
+                const hwnd = findWeChatHwnd()
+                if (!hwnd) return json({ ok: false, error: 'wechat not running' }, 503)
+                const q = new URL(req.url).searchParams
+                const session = (q.get('session') ?? '').trim()
+                if (!session) return json({ ok: false, error: 'missing session' }, 400)
+                let limit = 20
+                const limitStr = q.get('limit')
+                if (limitStr) {
+                    limit = Number(limitStr)
+                    if (!Number.isInteger(limit) || limit < 1) {
+                        return json({ ok: false, error: 'bad limit' }, 400)
+                    }
+                    limit = Math.min(limit, 200)
+                }
+                const result = await readMessages(hwnd, session, limit)
+                if (!result.ok) {
+                    if (result.reason === 'not-found') return json({ ok: false, error: 'session not found' }, 404)
+                    return json({ ok: false, error: 'read failed' }, 500)
+                }
+                return json({ messages: result.messages })
+            })
+        }
+        if (req.method === 'GET' && path === '/messages/db') {
+            // 读库增强（混合方案）：精确方向/发送人/完整历史。低频调用，不碰 UI（无 uiLock）。
+            const q = new URL(req.url).searchParams
+            const session = (q.get('session') ?? '').trim()
+            if (!session) return json({ ok: false, error: 'missing session' }, 400)
+            let limit = 20
+            const limitStr = q.get('limit')
+            if (limitStr) {
+                limit = Number(limitStr)
+                if (!Number.isInteger(limit) || limit < 1) return json({ ok: false, error: 'bad limit' }, 400)
+                limit = Math.min(limit, 200)
+            }
+            let offset = 0
+            const offsetStr = q.get('offset')
+            if (offsetStr) {
+                offset = Number(offsetStr)
+                if (!Number.isInteger(offset) || offset < 0) return json({ ok: false, error: 'bad offset' }, 400)
+            }
+            const result = readMessagesDb(session, limit, offset)
+            if (!result.ok) {
+                if (result.reason === 'session-not-found') return json({ ok: false, error: 'session not found' }, 404)
+                return json({ ok: false, error: 'read failed', reason: result.reason }, 500)
+            }
+            return json({ messages: result.messages, total: result.total })
+        }
         return apiDoc({ request: { method: req.method, path } })
     }
     const rc = server.listen(PORT, '127.0.0.1')
-    console.log('[api] /status /contacts /send at http://127.0.0.1:' + PORT +
+    console.log('[api] /status /contacts /send /messages /messages/db at http://127.0.0.1:' + PORT +
         ' (other requests -> API doc) listen rc=' + rc +
         ' addr=' + JSON.stringify(server.address()))
     return rc
