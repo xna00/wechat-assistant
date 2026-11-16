@@ -662,7 +662,7 @@ function execSql(db: SqlDb, sql: string): { rc: number; rows: (string | number |
                 // BLOB：读原始字节（zstd 压缩的 message_content 含 \0，column_text 会截断 → 必须 column_blob）
                 const blob = sqlite3_column_blob(stmt, c) as unknown as number
                 const n = Number(sqlite3_column_bytes(stmt, c))
-                row.push(blob && n > 0 ? new Uint8Array((ffi as unknown as { readBytes: (p: number, n: number) => ArrayBuffer }).readBytes(blob, n)) : null)
+                row.push(blob && n > 0 ? new Uint8Array(ffi.readBytes(blob, n)) : null)
             }
             rows.push(row)
         } else if (sr === SQLITE_DONE) { rc = 0; break }
@@ -748,7 +748,7 @@ function isValidText(s: string): boolean {
 /** 基础消息类型：local_type 低 32 位 = 类型；文件消息是特例大值 25769803825（微信 4.x 实测）。 */
 function msgBaseType(localType: number): string {
     if (localType === 25769803825) return 'file'        // 文件消息（特殊编码，非低 32 位分解）
-    const base = localType & 0xFFFFFFFF
+    const base = localType >>> 0                        // ToUint32 无符号取低 32 位（& 0xFFFFFFFF 用 ToInt32 有符号，低 32 位≥0x80000000 会变负）
     switch (base) {
         case 1: return 'text'
         case 3: return 'image'
