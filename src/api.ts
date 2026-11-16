@@ -2,7 +2,7 @@
 // 自描述：其余任何请求返回 API 使用说明（见 API_DOC）。
 // 绑定 guest 本地 127.0.0.1:8123（VM 内部调用，不做宿主端口映射）。
 import { createServer } from 'quickwin/lib/http-server.js'
-import { findWeChatHwnd, openContacts, listContacts, listContactsWithAvatar, sendToSession, readMessages } from './wechat.ts'
+import { findWeChatHwnd, openContacts, listContacts, listContactsWithAvatar, sendToSession, sendFileToSession, readMessages } from './wechat.ts'
 import { readMessagesDb } from './db.ts'
 
 const PORT = 8123
@@ -160,16 +160,22 @@ export function startApiServer(): number {
             return await withUiLock(async () => {
                 const hwnd = findWeChatHwnd()
                 if (!hwnd) return json({ ok: false, error: 'wechat not running' }, 503)
-                let body: { session?: unknown; message?: unknown }
+                let body: { session?: unknown; message?: unknown; file?: unknown }
                 try { body = await req.json() } catch {
                     return json({ ok: false, error: 'bad json' }, 400)
                 }
                 const session = typeof body?.session === 'string' ? body.session.trim() : ''
                 const message = typeof body?.message === 'string' ? body.message : ''
-                if (!session || !message) {
+                const file = typeof body?.file === 'string' ? body.file.trim() : ''
+                if (!session || (!message && !file)) {
                     return json({ ok: false, error: 'missing session/message' }, 400)
                 }
-                const result = await sendToSession(hwnd, session, message)
+                if (message && file) {
+                    return json({ ok: false, error: 'message and file are mutually exclusive' }, 400)
+                }
+                const result = file
+                    ? await sendFileToSession(hwnd, session, file)
+                    : await sendToSession(hwnd, session, message)
                 if (result === 'sent') return json({ ok: true })
                 if (result === 'not-found') return json({ ok: false, error: 'session not found' }, 404)
                 return json({ ok: false, error: 'send failed' }, 500)

@@ -4,8 +4,12 @@ import { UiaClient, TreeScope, type UiaElement, type Rect } from '@quickwinlabs/
 import { NULL, PtrArrayBuffer, type MaybePtr } from 'quickwin/lib/ffi/ctype.js'
 import {
     FindWindow, GetWindowRect, PostMessage, ScreenToClient, EnumWindows, IsWindowVisible, GetClassName,
+    SetForegroundWindow, SendInput, OpenClipboard, EmptyClipboard, SetClipboardData, CloseClipboard,
 } from 'quickwin/lib/windows/user32.js'
-import { RECT, POINT } from 'quickwin/lib/windows/structs.js'
+import {
+    GlobalAlloc, GlobalLock, GlobalUnlock, GlobalFree, RtlMoveMemory,
+} from 'quickwin/lib/windows/kernel32.js'
+import { RECT, POINT, INPUT } from 'quickwin/lib/windows/structs.js'
 import { closure } from 'quickwin/lib/ffi/bind.js'
 import { captureWindow, cropBmp, bmpToBase64 } from './avatar.ts'
 
@@ -488,6 +492,159 @@ export async function sendToSession(hwnd: MaybePtr<'HWND'>, session: string, mes
     const opened = await openSession(hwnd, session)
     if (opened !== 'opened') return opened
     return (await sendMessage(hwnd, message)) ? 'sent' : 'failed'
+}
+
+// ── 发送文件（剪贴板 CF_HDROP + SendInput Ctrl+V + 点发送）──
+// 微信原生识别剪贴板文件：Ctrl+V 粘贴到输入区显示为待发送附件，点"发送"发出。
+// 注意：SendInput 是真键盘事件，须微信窗口在前台焦点（会短暂抢焦点——发文件不可避免）；
+// 文本发送（sendMessage）仍走 PostMessage 后台不抢焦点。
+const CF_HDROP = 15
+const GMEM_MOVEABLE = 0x2, GMEM_ZEROINIT = 0x40
+const VK_CONTROL = 0x11, VK_V = 0x56, KEYEVENTF_KEYUP = 0x2
+
+/** 字符串 → UTF-16LE 字节（DROPFILES 路径编码用）。 */
+function utf16leBytes(s: string): Uint8Array {
+    const out = new Uint8Array(s.length * 2)
+    for (let i = 0; i < s.length; i++) {
+        const c = s.charCodeAt(i)
+        out[i * 2] = c & 0xff
+        out[i * 2 + 1] = (c >> 8) & 0xff
+    }
+    return out
+}
+
+/** 放文件路径列表到剪贴板（CF_HDROP，UTF-16 路径双 \0 结尾）。
+ *  成功 → true（系统接管内存，勿 GlobalFree）；失败 → false（已释放）。 */
+function clipboardSetFiles(paths: string[]): boolean {
+    let total = 20                                    // DROPFILES header
+    const parts: Uint8Array[] = []
+    for (const p of paths) {
+        const b = utf16leBytes(p)
+        parts.push(b)
+        total += b.length + 2                         // 路径 + 终止 \0
+    }
+    total += 2                                        // 列表终止 \0
+    const data = new PtrArrayBuffer(total)
+    const dv = new DataView(data)
+    dv.setUint32(0, 20, true)                         // pFiles = sizeof(DROPFILES)
+    dv.setUint32(4, 0, true)                          // pt.x
+    dv.setUint32(8, 0, true)                          // pt.y
+    dv.setUint32(12, 0, true)                         // fNC
+    dv.setUint32(16, 1, true)                         // fWide = UTF-16
+    const u8 = new Uint8Array(data)
+    let off = 20
+    for (const b of parts) {
+        u8.set(b, off)
+        off += b.length + 2                           // 路径 \0 由 ZEROINIT 保证
+    }
+    const hMem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total)
+    if (!hMem) return false
+    if (!OpenClipboard(NULL)) { GlobalFree(hMem); return false }
+    let handed = false
+    try {
+        if (!EmptyClipboard()) return false
+        const p = GlobalLock(hMem)
+        if (!p) return false
+        RtlMoveMemory(p, data, total)
+        GlobalUnlock(hMem)
+        if (!SetClipboardData(CF_HDROP, hMem)) return false
+        handed = true                                 // 系统接管内存
+        return true
+    } finally {
+        CloseClipboard()
+        if (!handed) GlobalFree(hMem)
+    }
+}
+
+/** SendInput 注入 Ctrl+V（真键盘事件，更新系统键盘状态 → 微信识别粘贴）。 */
+function sendCtrlV(): void {
+    const evs = [
+        { type: 1, data: { ki: { wVk: VK_CONTROL, wScan: 0, dwFlags: 0, time: 0, dwExtraInfo: 0 } } },
+        { type: 1, data: { ki: { wVk: VK_V, wScan: 0, dwFlags: 0, time: 0, dwExtraInfo: 0 } } },
+        { type: 1, data: { ki: { wVk: VK_V, wScan: 0, dwFlags: KEYEVENTF_KEYUP, time: 0, dwExtraInfo: 0 } } },
+        { type: 1, data: { ki: { wVk: VK_CONTROL, wScan: 0, dwFlags: KEYEVENTF_KEYUP, time: 0, dwExtraInfo: 0 } } },
+    ]
+    SendInput(evs.length, evs, INPUT.size)
+}
+
+/** 定位"发送"按钮（name=发送，输入框下缘下方右半——同 sendMessage 的规则）。
+ *  调用方负责 release。 */
+function findSendButton(c: UiaClient, hwnd: MaybePtr<'HWND'>, inputRect: Rect | null): UiaElement | null {
+    const root = c.elementFromHandle(hwnd)
+    if (!root) return null
+    try {
+        return findFirst(root, (el: UiaElement) => {
+            if (el.controlType() !== 50000 || el.name().trim() !== '发送') return false
+            const r = el.rect()
+            if (!r) return false
+            if (!inputRect) return true
+            const midX = inputRect.left + (inputRect.right - inputRect.left) / 2
+            return r.left >= midX && r.top >= inputRect.bottom - 20
+        })
+    } finally {
+        root.release()
+    }
+}
+
+/** 轮询发送按钮 enabled 状态（文件附件出现 → 按钮变绿 enabled；发送完 → 回灰 disabled）。 */
+async function waitSendButtonEnabled(
+    c: UiaClient, hwnd: MaybePtr<'HWND'>, inputRect: Rect | null,
+    want: boolean, timeoutMs: number,
+): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+        const btn = findSendButton(c, hwnd, inputRect)
+        if (btn) {
+            try {
+                if (btn.isEnabled() === want) return true
+            } finally {
+                btn.release()
+            }
+        }
+        await delay(300)
+    }
+    return false
+}
+
+/** 打开会话并发送文件（剪贴板 CF_HDROP + SendInput Ctrl+V 粘贴为附件 + 点发送）。
+ *  校验：粘贴后发送按钮变 enabled（附件出现）→ 点发送 → 按钮回 disabled（已发出）。
+ *  返回 sent / not-found / failed。 */
+export async function sendFileToSession(
+    hwnd: MaybePtr<'HWND'>, session: string, filePath: string,
+): Promise<SendResult> {
+    const opened = await openSession(hwnd, session)
+    if (opened !== 'opened') return opened
+    const c = uia()
+    if (!c) return 'failed'
+    const root = c.elementFromHandle(hwnd)
+    if (!root) return 'failed'
+    try {
+        const input = findFirst(root, (el: UiaElement) =>
+            el.className() === 'mmui::ChatInputField' && el.controlType() === 50004)
+        if (!input) return 'failed'
+        const inputRect = input.rect()
+        input.release()
+        if (!clipboardSetFiles([filePath])) return 'failed'
+        // 真键盘事件需前台焦点：激活微信窗口 + 聚焦输入框（后台点击）
+        SetForegroundWindow(hwnd)
+        await delay(300)
+        if (inputRect) {
+            bgClickAt(hwnd, (inputRect.left + inputRect.right) / 2, (inputRect.top + inputRect.bottom) / 2)
+        }
+        await delay(200)
+        sendCtrlV()
+        // 等文件附件出现（发送按钮 enabled）
+        if (!await waitSendButtonEnabled(c, hwnd, inputRect, true, 6000)) return 'failed'
+        const send = findSendButton(c, hwnd, inputRect)
+        if (!send) return 'failed'
+        send.click()
+        send.release()
+        // 等发送完成（按钮回 disabled）
+        if (!await waitSendButtonEnabled(c, hwnd, inputRect, false, 8000)) return 'failed'
+        return 'sent'
+    } finally {
+        root.release()
+    }
 }
 
 // ── 读消息 ──
