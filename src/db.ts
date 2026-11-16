@@ -4,6 +4,7 @@
 // 方向 / 发送人精确（real_sender_id→Name2Id→user_name→self 判定），完整历史分页。
 import 'quickwin/lib/polyfill.js'
 import * as ffi from 'ffi'
+import { decompress as zstdDecompress } from 'fzstd'
 import { bind } from 'quickwin/lib/ffi/bind.js'
 import { struct } from 'quickwin/lib/ffi/struct.js'
 import { NULL, PtrArrayBuffer, type C_Struct, type Ptr } from 'quickwin/lib/ffi/ctype.js'
@@ -600,6 +601,8 @@ const sqlite3_prepare_v2 = bind('winsqlite3.dll', 'sqlite3_prepare_v2', '<>ptr <
 const sqlite3_step = bind('winsqlite3.dll', 'sqlite3_step', '<>ptr -> i32')
 const sqlite3_column_type = bind('winsqlite3.dll', 'sqlite3_column_type', '<>ptr i32 -> i32')
 const sqlite3_column_text = bind('winsqlite3.dll', 'sqlite3_column_text', '<>ptr i32 -> <>ptr')
+const sqlite3_column_blob = bind('winsqlite3.dll', 'sqlite3_column_blob', '<>ptr i32 -> <>ptr')
+const sqlite3_column_bytes = bind('winsqlite3.dll', 'sqlite3_column_bytes', '<>ptr i32 -> i32')
 const sqlite3_column_int64 = bind('winsqlite3.dll', 'sqlite3_column_int64', '<>ptr i32 -> u64')
 const sqlite3_finalize = bind('winsqlite3.dll', 'sqlite3_finalize', '<>ptr -> i32')
 const sqlite3_close = bind('winsqlite3.dll', 'sqlite3_close', '<>ptr -> i32')
@@ -632,9 +635,9 @@ function openDbMemory(plain: Uint8Array): SqlDb | null {
     return { handle: db, path: ':memory:' }
 }
 function closeDb(db: SqlDb): void { sqlite3_close(db.handle) }
-function execSql(db: SqlDb, sql: string): { rc: number; rows: (string | number | null)[][] } {
+function execSql(db: SqlDb, sql: string): { rc: number; rows: (string | number | Uint8Array | null)[][] } {
     const EXEC_TRACE = false
-    const rows: (string | number | null)[][] = []
+    const rows: (string | number | Uint8Array | null)[][] = []
     const stmtBuf = new PtrArrayBuffer(8)
     const prc = sqlite3_prepare_v2(db.handle, toUtf8(sql), -1, ffi.bufferPtr(stmtBuf), NULL)
     const stmt = Number(new DataView(stmtBuf).getBigUint64(0, true))
@@ -650,14 +653,16 @@ function execSql(db: SqlDb, sql: string): { rc: number; rows: (string | number |
         const sr = sqlite3_step(stmt)
         if (EXEC_TRACE) console.log('[exec] step=' + sr)
         if (sr === SQLITE_ROW) {
-            const row: (string | number | null)[] = []
+            const row: (string | number | Uint8Array | null)[] = []
             for (let c = 0; c < nCol; c++) {
                 const t = sqlite3_column_type(stmt, c)
                 if (t === SQLITE_NULL) { row.push(null); continue }
                 if (t === SQLITE_TEXT) { row.push(readCStr(sqlite3_column_text(stmt, c) as unknown as number)); continue }
                 if (t === SQLITE_INTEGER || t === SQLITE_FLOAT) { row.push(Number(sqlite3_column_int64(stmt, c))); continue }
-                // BLOB：读文本近似（非文本消息会过滤）
-                row.push(readCStr(sqlite3_column_text(stmt, c) as unknown as number))
+                // BLOB：读原始字节（zstd 压缩的 message_content 含 \0，column_text 会截断 → 必须 column_blob）
+                const blob = sqlite3_column_blob(stmt, c) as unknown as number
+                const n = Number(sqlite3_column_bytes(stmt, c))
+                row.push(blob && n > 0 ? new Uint8Array((ffi as unknown as { readBytes: (p: number, n: number) => ArrayBuffer }).readBytes(blob, n)) : null)
             }
             rows.push(row)
         } else if (sr === SQLITE_DONE) { rc = 0; break }
@@ -694,7 +699,16 @@ function decryptDbFile(key: Uint8Array, src: Uint8Array): Uint8Array | null {
 }
 
 // ============ 消息查询 ============
-export interface DbMessage { direction: 'in' | 'out'; text: string; time: number; sender: string }
+export interface DbMessage {
+    direction: 'in' | 'out'
+    text: string
+    time: number
+    sender: string
+    /** 消息类型：text|image|file|voice|video|link|system|sticker|location|unknown */
+    type: string
+    /** 文件/图片消息的文件名（解压 XML 提取；图片可能拿不到则缺省） */
+    fileName?: string
+}
 export interface ReadMessagesDbResult {
     ok: boolean; reason?: string; messages?: DbMessage[]; total?: number; detail?: string
 }
@@ -730,6 +744,82 @@ function isValidText(s: string): boolean {
     return printable / s.length > 0.9
 }
 
+// ============ 消息类型 / 内容解析（社区方案：local_type + WCDB_CT zstd 解压 + XML 解析）============
+/** 基础消息类型：local_type 低 32 位 = 类型；文件消息是特例大值 25769803825（微信 4.x 实测）。 */
+function msgBaseType(localType: number): string {
+    if (localType === 25769803825) return 'file'        // 文件消息（特殊编码，非低 32 位分解）
+    const base = localType & 0xFFFFFFFF
+    switch (base) {
+        case 1: return 'text'
+        case 3: return 'image'
+        case 34: return 'voice'
+        case 43: return 'video'
+        case 47: return 'sticker'
+        case 48: return 'location'
+        case 49: return 'link'                          // 链接/文件/引用/小程序（解压 XML 细分）
+        case 10000: return 'system'
+        case 10002: return 'system'
+        default: return 'unknown'
+    }
+}
+
+/** UTF-8 字节 → string（zstd 解压后 / 未压缩 BLOB 的文本）。 */
+function utf8Decode(u8: Uint8Array): string {
+    try { return new TextDecoder().decode(u8) } catch {
+        let s = ''
+        let i = 0
+        while (i < u8.length) {
+            const b = u8[i]!
+            let cp = 0, n = 1
+            if (b < 0x80) { cp = b; n = 1 }
+            else if ((b & 0xe0) === 0xc0) { cp = b & 0x1f; n = 2 }
+            else if ((b & 0xf0) === 0xe0) { cp = b & 0x0f; n = 3 }
+            else if ((b & 0xf8) === 0xf0) { cp = b & 0x07; n = 4 }
+            else { i++; continue }
+            let ok = true
+            for (let k = 1; k < n; k++) {
+                const nb = u8[i + k]
+                if (nb === undefined || (nb & 0xc0) !== 0x80) { ok = false; break }
+                cp = (cp << 6) | (nb & 0x3f)
+            }
+            if (!ok) { i++; continue }
+            i += n
+            if (cp >= 0x10000) { cp -= 0x10000; s += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff)) }
+            else s += String.fromCharCode(cp)
+        }
+        return s
+    }
+}
+
+/** zstd 解压 message_content BLOB（WCDB_CT_message_content = 4）。失败 → null。 */
+function zstdInflate(u8: Uint8Array): string | null {
+    try { return utf8Decode(zstdDecompress(u8)) } catch { return null }
+}
+
+/** 正则提取 XML 标签值（跨行）。 */
+function xmlTag(xml: string, tag: string): string {
+    const m = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`).exec(xml)
+    return m ? m[1]!.trim() : ''
+}
+
+/** 解析消息内容（可能 zstd 压缩 BLOB）→ 文本 + 文件名 + appmsg 子类型。 */
+function parseContent(raw: string | Uint8Array | null, ct: number): { text: string; fileName: string; subType: string } {
+    let content = ''
+    if (ct === 4 && raw instanceof Uint8Array) {
+        const dec = zstdInflate(raw)
+        if (dec === null) return { text: '', fileName: '', subType: '' }
+        content = dec
+    } else if (typeof raw === 'string') {
+        content = raw
+    } else if (raw instanceof Uint8Array) {
+        content = utf8Decode(raw)
+    }
+    const isAppmsg = content.includes('<appmsg')
+    const subType = isAppmsg ? xmlTag(content, 'type') : ''
+    const fileName = isAppmsg ? xmlTag(content, 'title') : ''
+    return { text: content, fileName, subType }
+}
+
 /** 读库主入口：精确方向/发送人/完整历史分页。低频调用（UIA 主路径 /messages）。
  *  带重试：微信写库时可能撕裂读（瞬态），重读新快照即恢复。 */
 export function readMessagesDb(session: string, limit: number, offset: number): ReadMessagesDbResult {
@@ -746,6 +836,74 @@ export function readMessagesDb(session: string, limit: number, offset: number): 
         }
     }
     return { ok: false, reason: 'internal', detail: lastErr }
+}
+
+/** 诊断：探会话消息表结构 + 最新 N 行原始值（开发/排障用）。
+ *  文件、图片消息的真实内容不在 message_content 列（读回 text 为空），
+ *  用此定位存放文件名/图片元数据的列。返回表列名 + 原始行。 */
+export interface ProbeRow { values: (string | number | Uint8Array | null)[] }
+export interface ProbeDbResult {
+    ok: boolean
+    reason?: string
+    table?: string
+    columns?: string[]
+    rows?: ProbeRow[]
+    tables?: string[]
+    detail?: string
+}
+export function probeSessionDb(session: string, limit = 8): ProbeDbResult {
+    try {
+        const dirs = findDbDir()
+        if (!dirs) return { ok: false, reason: 'db-dir-not-found' }
+        const { keys } = getWeixinKeys()
+        if (!keys.length) return { ok: false, reason: 'key-extract-failed' }
+        const msgSrc = readFileStable(dirs.message)
+        if (!msgSrc) return { ok: false, reason: 'read-msg-failed' }
+        const saltHex = bytesToHex(msgSrc.subarray(0, 16))
+        const cand = keys.find(c => c.salt === saltHex)
+        if (!cand) return { ok: false, reason: 'no-key-for-msg' }
+        const encSalt = cand.salt ? hexToBytes(cand.salt) : msgSrc.subarray(0, 16)
+        if (!verifyDbHmac(msgSrc, hexToBytes(cand.key), encSalt)) return { ok: false, reason: 'hmac-fail' }
+        const msgPlain = decryptDbFile(hexToBytes(cand.key), msgSrc)
+        if (!msgPlain) return { ok: false, reason: 'decrypt-msg-failed' }
+        const msgDb = openDbMemory(msgPlain)
+        if (!msgDb) return { ok: false, reason: 'open-msg-failed' }
+        let contactDb: SqlDb | null = null
+        let contactLoaded = false
+        const loadContact = (): SqlDb | null => {
+            if (contactLoaded) return contactDb
+            contactLoaded = true
+            try {
+                const cSrc = readFileStable(dirs.contact)
+                if (!cSrc) return null
+                const cKey = keys.find(c => c.salt === bytesToHex(cSrc.subarray(0, 16)))
+                if (!cKey) return null
+                const cEncKey = hexToBytes(cKey.key)
+                const cEncSalt = cKey.salt ? hexToBytes(cKey.salt) : cSrc.subarray(0, 16)
+                if (!verifyDbHmac(cSrc, cEncKey, cEncSalt)) return null
+                const cPlain = decryptDbFile(cEncKey, cSrc)
+                if (!cPlain) return null
+                contactDb = openDbMemory(cPlain)
+                return contactDb
+            } catch (e) { contactDb = null; return null }
+        }
+        try {
+            const userName = resolveUserName(session, msgDb, loadContact)
+            if (!userName) return { ok: false, reason: 'session-not-found' }
+            const table = 'Msg_' + md5Hex(userName)
+            const tblCheck = execSql(msgDb, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='${table}'`)
+            if (!tblCheck.rows.length || Number(tblCheck.rows[0]![0]) === 0) return { ok: false, reason: 'session-not-found' }
+            const cols = execSql(msgDb, `PRAGMA table_info("${table}")`).rows.map(r => String(r[1]))
+            const lim = Math.max(1, Math.min(limit, 50))
+            const rows = execSql(msgDb, `SELECT * FROM "${table}" ORDER BY create_time DESC, local_id DESC LIMIT ${lim}`).rows
+            const tables = execSql(msgDb, "SELECT name FROM sqlite_master WHERE type='table'").rows.map(r => String(r[0]))
+            return { ok: true, table, columns: cols, rows: rows.map(r => ({ values: r })), tables }
+        } finally {
+            if (contactDb) closeDb(contactDb)
+        }
+    } catch (e) {
+        return { ok: false, reason: 'throw', detail: String(e) }
+    }
 }
 
 /** 当前登录账号 wxid（权威）：数据目录名 <wxid>_<suffix>（如 wxid_xxx_dff7），
@@ -850,17 +1008,34 @@ function readMessagesDbOnce(session: string, limit: number, offset: number): Rea
             const off = Math.max(0, offset)
             // 先取数据页（COUNT 全表扫描可能撞坏页，数据查询优先）
             const q = execSql(msgDb,
-                `SELECT create_time, real_sender_id, message_content FROM "${table}" ORDER BY create_time DESC, local_id DESC LIMIT ${lim} OFFSET ${off}`)
+                `SELECT create_time, real_sender_id, message_content, local_type, WCDB_CT_message_content FROM "${table}" ORDER BY create_time DESC, local_id DESC LIMIT ${lim} OFFSET ${off}`)
             t('query: rows=' + q.rows.length)
             const messages: DbMessage[] = []
             for (const r of q.rows) {
                 const time = Number(r[0] ?? 0)
                 const senderId = Number(r[1] ?? 0)
-                const content = String(r[2] ?? '')
-                if (!isValidText(content)) continue
+                const rawContent = r[2] as string | Uint8Array | null
+                const localType = Number(r[3] ?? 0)
+                const ct = Number(r[4] ?? 0)
+                // 类型 + 内容解析（zstd 解压 + XML）
+                let type = msgBaseType(localType)
+                const { text, fileName, subType } = parseContent(rawContent, ct)
+                if (type === 'link') {
+                    // type 49 家族：XML <type> 子类型（4/6=文件、57=引用、5=链接）
+                    if (subType === '4' || subType === '6') type = 'file'
+                    else if (subType === '57') type = 'quote'
+                    else type = 'link'
+                }
+                // 文本消息要求可读文本；媒体消息类型标记（文件/图片/视频等即使无文本也返回）
+                const displayText = (type === 'text' || type === 'system' || type === 'link' || type === 'quote')
+                    ? text : ''
+                if ((type === 'text' || type === 'system') && !isValidText(displayText)) continue
+                if (type === 'unknown' && !isValidText(text)) continue
                 const senderUser = nameMap.get(senderId) ?? ''
                 const direction: 'in' | 'out' = (senderUser && selfWxid && senderUser === selfWxid) ? 'out' : 'in'
-                messages.push({ direction, text: content, time, sender: senderUser })
+                const msg: DbMessage = { direction, text: displayText, time, sender: senderUser, type }
+                if (fileName) msg.fileName = fileName
+                messages.push(msg)
             }
             messages.reverse()
             // COUNT 全表扫描（best-effort；撞坏页则返回 -1，不阻塞数据）
