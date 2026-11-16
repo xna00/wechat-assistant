@@ -1,13 +1,15 @@
 // createRoot 建主窗 → render 挂 React 树；关窗只隐藏到托盘，托盘右键菜单里退出
 // 构建 npm run build；运行 dist\app.exe（-o CON 看 stdout）
+// 业务模块（api/tray/App）用动态 import，live 版据此拆 chunk。
 import 'quickwin/lib/polyfill.js'   // React 调度要用 setTimeout / console
 import { createRoot } from 'quickwin/lib/react-qw/index.js'
 import { ShowWindow } from 'quickwin/lib/windows/user32.js'
 import { ShowWindowCmd, WmMsg } from 'quickwin/constants'
 import { APP_TITLE } from './config.ts'
-import { App } from './App.tsx'
-import { installTray } from './tray.ts'
-import { startApiServer } from './api.ts'
+
+const { startApiServer } = await import('./api.ts')
+const { installTray } = await import('./tray.ts')
+const { App } = await import('./App.tsx')
 
 // 先起 HTTP API（/status），再建 GUI 窗口
 startApiServer()

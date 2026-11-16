@@ -18,12 +18,15 @@
     font-size: 1.05em; transition: background .15s;
   }
   a.dl:hover { background: #0b5fc1; }
+  .dl + .dl { margin-top: 12px; }
+  .sub { display: block; font-size: .75em; opacity: .85; margin-top: 4px; }
   .meta { color: #888; font-size: .8em; margin-top: 24px; }
 </style>
 </head>
 <body>
   <h1>微信助手</h1>
-  <a class="dl" href="wechat-assistant.exe" download>下载 wechat-assistant.exe</a>
-  <p class="meta">单文件 · 免安装</p>
+  <a class="dl" href="wechat-assistant-live.exe" download>下载 live 版<span class="sub">exe 极小，启动时拉最新代码</span></a>
+  <a class="dl" href="wechat-assistant.exe" download>下载完整版<span class="sub">单文件 · 免安装 · 离线可用</span></a>
+  <p class="meta">更新时只需重新下载 live 版 exe（很小），代码自动拉取最新</p>
 </body>
 </html>

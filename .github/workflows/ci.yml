@@ -23,14 +23,17 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build (tsc + esbuild + brotli embed)
+      - name: Build (tsc + rolldown + brotli embed)
         run: npm run build
 
-      # 组装 GitHub Pages 产物（dist/app.exe -> dist-pages/wechat-assistant.exe）
+      # 组装 GitHub Pages 产物：完整版 + live 版（entry.js + chunk-*.js）+ 下载页
       - name: Assemble pages
         run: |
           mkdir -p dist-pages
           cp dist/app.exe dist-pages/wechat-assistant.exe
+          cp dist-live/wechat-assistant-live.exe dist-pages/wechat-assistant-live.exe
+          cp dist-live/entry.js dist-pages/entry.js
+          cp dist-live/chunk-*.js dist-pages/
           cp pages/index.html dist-pages/index.html
           touch dist-pages/.nojekyll
 
