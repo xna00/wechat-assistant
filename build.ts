@@ -117,7 +117,7 @@ console.log(`  live js: ${liveJs.join(', ')}`)
 const loaderSrc =
     `const BASE = ${JSON.stringify(LIVE_BASE)}\n` +
     `try { await import(BASE + '/entry.js?ts=' + Date.now()) }\n` +
-    `catch (e) { console.error('live entry load failed:', e) }\n`
+    `catch (e) { console.log('live entry load failed:', e) }\n`
 const loaderPacked = brotliCompressSync(Buffer.from(loaderSrc, 'utf8'))
 const liveOut = Buffer.alloc(baseExe.length + loaderPacked.length + 8)
 baseExe.copy(liveOut, 0)
