@@ -5,7 +5,7 @@
 import 'quickwin/lib/polyfill.js'
 import * as ffi from 'ffi'
 import { decompress as zstdDecompress } from 'fzstd'
-import { bind } from 'quickwin/lib/ffi/bind.js'
+import { bind, WCHAR } from 'quickwin/lib/ffi/bind.js'
 import { struct } from 'quickwin/lib/ffi/struct.js'
 import { NULL, PtrArrayBuffer, type C_Struct, type Ptr } from 'quickwin/lib/ffi/ctype.js'
 import {
@@ -13,8 +13,18 @@ import {
     ReadProcessMemory, CreateFile, ReadFile, WriteFile, GetFileSize,
     FindFirstFile, FindNextFile, FindClose,
     GetTempPath, GetEnvironmentVariable, GetLastError,
+    VirtualQueryEx, GetProcessTimes, GetFileAttributes,
 } from 'quickwin/lib/windows/kernel32.js'
-import { PROCESSENTRY32W, WIN32_FIND_DATAW } from 'quickwin/lib/windows/structs.js'
+import {
+    PROCESSENTRY32W, WIN32_FIND_DATAW,
+    MEMORY_BASIC_INFORMATION,
+} from 'quickwin/lib/windows/structs.js'
+import {
+    BCryptOpenAlgorithmProvider, BCryptSetProperty, BCryptGenerateSymmetricKey,
+    BCryptDecrypt, BCryptDestroyKey, BCryptCloseAlgorithmProvider,
+    BCryptCreateHash, BCryptHashData, BCryptFinishHash, BCryptDestroyHash,
+} from 'quickwin/lib/windows/bcrypt.js'
+import { MemState, MemType, PageProtect, BcryptAlgFlag } from 'quickwin/constants.js'
 
 // ============ 常量 ============
 const CONFIG_CIPHER_NAME = new TextEncoder().encode('com.Tencent.WCDB.Config.Cipher')
@@ -23,18 +33,10 @@ const CONFIG_XOR_MASK = Uint8Array.from([
     0x45, 0x00, 0x48, 0x84, 0x4c, 0x24, 0x48, 0x48, 0x89, 0x44, 0x25, 0x40, 0x48, 0x58, 0x4c, 0x24,
 ])
 const HEX_LITERAL_RE = /[xX]'([0-9a-fA-F]{64,192})'/g
-const MBI_DECL = {
-    '#': 'struct', BaseAddress: '<>ptr', AllocationBase: '<>ptr', AllocationProtect: 'u32',
-    RegionSize: 'u64', State: 'u32', Protect: 'u32', Type: 'u32',
-} satisfies C_Struct
-const MBI = struct('MBI', MBI_DECL)
-const VirtualQueryEx = bind('kernel32.dll', 'VirtualQueryEx', '<HPROCESS>ptr <>ptr <MBI>ptr u64 -> u64')
-const GetProcessTimes = bind('kernel32.dll', 'GetProcessTimes', '<HPROCESS>ptr <>ptr <>ptr <>ptr <>ptr -> i32')
-const GetFileAttributes = bind('kernel32.dll', 'GetFileAttributesW', '<WCHAR>ptr! -> u32')
+// MEMORY_BASIC_INFORMATION / VirtualQueryEx / GetProcessTimes / GetFileAttributes 现从
+// quickwin 主仓 import（见文件头部），MEM_*/PAGE_* 常量走 constants.ts 的 MemState/MemType/
+// PageProtect 枚举（gen_const 生成），此处不再手写绑定。
 const MAX_USER_ADDR = 0x0000_8000_0000_0000
-const MEM_COMMIT = 0x1000
-const MEM_PRIVATE = 0x20000
-const PAGE_GUARD = 0x100
 const INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
 const SQLITE_ROW = 100
 const SQLITE_DONE = 101
@@ -170,15 +172,20 @@ function processCreateTime(h: Ptr<'HPROCESS'>): bigint {
 }
 
 function getUserProfile(): string {
-    const buf = new PtrArrayBuffer(1024)
-    const n = GetEnvironmentVariable('USERPROFILE', buf, 1024)
+    // nSize 单位是 WCHAR（=2 字节）：WCHAR.alloc(512) = 512 字符 = 1024B，与 nSize=512 对齐。
+    // 旧版传 nSize=1024（=2048B 声称容量）但 buf 只 1024B——native 若按 nSize 处理会越界写。
+    const buf = WCHAR.alloc(512)
+    const n = GetEnvironmentVariable('USERPROFILE', buf.ptr, 512)
     if (n === 0) return ''
     return readWStrBuf(buf)
 }
 
 function getTempDir(): string {
-    const buf = new PtrArrayBuffer(1024)
-    const n = GetTempPath(1024, buf)
+    // GetTempPath 的 nBufferLength 单位是 WCHAR：WCHAR.alloc(512) = 1024B，与 nBufferLength=512
+    // 恰好对齐。旧版传 1024（=2048B）但 buf 只有 1024B——native 内部按 nBufferLength 清空
+    // buffer（memset 2048B）越界写 1024B，破坏相邻堆分配 → 后续 UIA 崩溃（E115 铁证）。
+    const buf = WCHAR.alloc(512)
+    const n = GetTempPath(512, buf.ptr)
     if (n === 0) return 'C:\\Windows\\Temp'
     return readWStrBuf(buf)
 }
@@ -236,13 +243,14 @@ function extractKeys(pid: number): { key: string; salt: string }[] {
         const hits: number[] = []
         let addr = 0
         while (addr < MAX_USER_ADDR) {
-            const mbi = MBI.alloc()
-            if (Number(VirtualQueryEx(hp, addr, mbi.ptr, 48n)) === 0) break
-            const d = MBI.decode(mbi)
+            const mbi = MEMORY_BASIC_INFORMATION.alloc()
+            // dwLength 单位字节 = struct size（x64 48B）；u64 参数须 BigInt
+            if (Number(VirtualQueryEx(hp, addr, mbi.ptr, BigInt(MEMORY_BASIC_INFORMATION.size))) === 0) break
+            const d = MEMORY_BASIC_INFORMATION.decode(mbi)
             const base = d.BaseAddress
             const size = Number(d.RegionSize)
-            if (d.State === MEM_COMMIT && ((d.Protect & 0xFF) & 0xE6) !== 0 && (d.Protect & PAGE_GUARD) === 0 && size > 0 && size < 0x10000000) {
-                if (!onlyPrivate || d.Type === MEM_PRIVATE) {
+            if (d.State === MemState.COMMIT && ((d.Protect & 0xFF) & 0xE6) !== 0 && (d.Protect & PageProtect.GUARD) === 0 && size > 0 && size < 0x10000000) {
+                if (!onlyPrivate || d.Type === MemType.PRIVATE) {
                     const buf = read(base, size)
                     if (buf) {
                         let pos = 0
@@ -398,16 +406,10 @@ function getWeixinKeys(): { pid: number; keys: { key: string; salt: string }[] }
 }
 
 // ============ bcrypt AES-256-CBC ============
-const BCryptOpenAlgorithmProvider = bind('bcrypt.dll', 'BCryptOpenAlgorithmProvider', '<>ptr <WCHAR>ptr <>ptr u32 -> i32')
-const BCryptSetProperty = bind('bcrypt.dll', 'BCryptSetProperty', '<>ptr <WCHAR>ptr <BYTE>ptr u32 u32 -> i32')
-const BCryptGenerateSymmetricKey = bind('bcrypt.dll', 'BCryptGenerateSymmetricKey', '<>ptr <>ptr <>ptr u32 <BYTE>ptr u32 u32 -> i32')
-const BCryptDecrypt = bind('bcrypt.dll', 'BCryptDecrypt', '<>ptr <BYTE>ptr u32 <>ptr <BYTE>ptr u32 <BYTE>ptr u32 <>ptr u32 -> i32')
-const BCryptDestroyKey = bind('bcrypt.dll', 'BCryptDestroyKey', '<>ptr -> i32')
-const BCryptCloseAlgorithmProvider = bind('bcrypt.dll', 'BCryptCloseAlgorithmProvider', '<>ptr u32 -> i32')
-
+// BCrypt* 绑定现从 quickwin 主仓 lib/windows/bcrypt.js import（见文件头部）。
 function decryptAesCbc(key: Uint8Array, data: Uint8Array, iv: Uint8Array): Uint8Array | null {
     const hAlgBuf = new PtrArrayBuffer(8)
-    if (BCryptOpenAlgorithmProvider(ffi.bufferPtr(hAlgBuf), 'AES', NULL, 0) !== 0) return null
+    if (BCryptOpenAlgorithmProvider(ffi.bufferPtr(hAlgBuf), 'AES', NULL, BcryptAlgFlag.NONE) !== 0) return null
     const hAlg = Number(new DataView(hAlgBuf).getBigUint64(0, true))
     if (!hAlg) return null
     const chaining = new TextEncoder().encode('ChainingModeCBC\0')
@@ -434,15 +436,12 @@ function decryptAesCbc(key: Uint8Array, data: Uint8Array, iv: Uint8Array): Uint8
 }
 
 // ===== CNG HMAC-SHA512（SQLCipher4 每页 HMAC 校验，检测撕裂读）=====
-const BCryptCreateHash = bind('bcrypt.dll', 'BCryptCreateHash', '<>ptr <>ptr <>ptr u32 <BYTE>ptr u32 u32 -> i32')
-const BCryptHashData = bind('bcrypt.dll', 'BCryptHashData', '<>ptr <BYTE>ptr u32 u32 -> i32')
-const BCryptFinishHash = bind('bcrypt.dll', 'BCryptFinishHash', '<>ptr <BYTE>ptr u32 u32 -> i32')
-const BCryptDestroyHash = bind('bcrypt.dll', 'BCryptDestroyHash', '<>ptr -> i32')
-const BCRYPT_ALG_HANDLE_HMAC_FLAG = 0x8
+// BCryptCreateHash/HashData/FinishHash/DestroyHash + BcryptAlgFlag.HMAC
+// 现从 quickwin 主仓 lib/windows/bcrypt.js import（见文件头部）。
 
 function hmacSha512(key: Uint8Array, data: Uint8Array): Uint8Array | null {
     const hAlgBuf = new PtrArrayBuffer(8)
-    if (BCryptOpenAlgorithmProvider(ffi.bufferPtr(hAlgBuf), 'SHA512', NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG) !== 0) return null
+    if (BCryptOpenAlgorithmProvider(ffi.bufferPtr(hAlgBuf), 'SHA512', NULL, BcryptAlgFlag.HMAC) !== 0) return null
     const hAlg = Number(new DataView(hAlgBuf).getBigUint64(0, true))
     if (!hAlg) return null
     const hHashBuf = new PtrArrayBuffer(8)

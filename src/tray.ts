@@ -8,6 +8,7 @@ import {
     SetForegroundWindow, ShowWindow, TrackPopupMenu,
 } from 'quickwin/lib/windows/user32.js'
 import { GetModuleFileName } from 'quickwin/lib/windows/kernel32.js'
+import { WCHAR } from 'quickwin/lib/ffi/bind.js'
 import { NOTIFYICONDATAW, POINT } from 'quickwin/lib/windows/structs.js'
 import { ShellExecute, ShellNotifyIcon } from 'quickwin/lib/windows/shell32.js'
 import {
@@ -63,8 +64,10 @@ export function installTray(hwnd: gui.HWND) {
     }
 
     function restart() {
-        const buf = new PtrArrayBuffer(1024)                    // 512 WCHAR
-        if (GetModuleFileName(NULL, buf, 512) === 0) return     // 拿当前 exe 路径失败
+        // GetModuleFileName 出参是 <WCHAR>ptr，nSize 单位 WCHAR：WCHAR.alloc(512) = 1024B
+        // 与 nSize=512 对齐（tray 旧版已用对 nSize=512，改 <WCHAR>ptr 后强制 .ptr）。
+        const buf = WCHAR.alloc(512)                            // 512 WCHAR
+        if (GetModuleFileName(NULL, buf.ptr, 512) === 0) return // 拿当前 exe 路径失败
         const exe = readWStrBuf(buf)
         if (!exe) return
         // 先启动新实例，成功（>32）才关服务/退出；若启动失败则不动作（保服务、保窗口）。

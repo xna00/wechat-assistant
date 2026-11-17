@@ -2,8 +2,9 @@
 // 自描述：其余任何请求返回 API 使用说明（见 API_DOC）。
 // 绑定 guest 本地 127.0.0.1:8123（VM 内部调用，不做宿主端口映射）。
 import { createServer } from 'quickwin/lib/http-server.js'
-import { findWeChatHwnd, openContacts, listContacts, listContactsWithAvatar, sendToSession, sendFileToSession, readMessages } from './wechat.ts'
+import { findWeChatHwnd, openContacts, listContacts, listContactsWithAvatar, sendToSession, sendFileToSession, readMessages, openSession } from './wechat.ts'
 import { readMessagesDb } from './db.ts'
+import { log } from './log.ts'
 
 const PORT = 8123
 
@@ -36,6 +37,19 @@ const API_DOC = {
             errors: [
                 { status: 503, error: 'wechat not running' },
                 { status: 500, error: 'contacts page unavailable' },
+            ],
+        },
+        {
+            method: 'GET',
+            path: '/session/open',
+            description: '打开会话（列表快路径优先，不在列表则顶部搜索兜底；选中后自动清理搜索态）。不发送消息。',
+            query: { session: '必填，会话名（显示名或 user_name，如 文件传输助手/谢/wxid_...）' },
+            response: { ok: true, opened: 'opened|not-found|failed' },
+            errors: [
+                { status: 400, error: 'missing session' },
+                { status: 503, error: 'wechat not running' },
+                { status: 404, error: 'session not found' },
+                { status: 500, error: 'open failed' },
             ],
         },
         {
@@ -168,6 +182,21 @@ export function startApiServer(): number {
                 return json({ contacts: await listContacts(hwnd) })
             })
         }
+        if (req.method === 'GET' && path === '/session/open') {
+            return await withUiLock(async () => {
+                const hwnd = findWeChatHwnd()
+                if (!hwnd) return json({ ok: false, error: 'wechat not running' }, 503)
+                const q = new URL(req.url).searchParams
+                const session = (q.get('session') ?? '').trim()
+                if (!session) return json({ ok: false, error: 'missing session' }, 400)
+                log('[api] /session/open "' + session + '"')
+                const result = await openSession(hwnd, session)
+                log('[api] /session/open "' + session + '" → ' + result)
+                if (result === 'opened') return json({ ok: true, opened: result })
+                if (result === 'not-found') return json({ ok: false, error: 'session not found', opened: result }, 404)
+                return json({ ok: false, error: 'open failed', opened: result }, 500)
+            })
+        }
         if (req.method === 'POST' && path === '/send') {
             return await withUiLock(async () => {
                 const hwnd = findWeChatHwnd()
@@ -246,7 +275,7 @@ export function startApiServer(): number {
     }
     server = srv
     const rc = srv.listen(PORT, '127.0.0.1')
-    console.log('[api] /status /contacts /send /messages /messages/db at http://127.0.0.1:' + PORT +
+    console.log('[api] /status /contacts /session/open /send /messages /messages/db at http://127.0.0.1:' + PORT +
         ' (other requests -> API doc) listen rc=' + rc +
         ' addr=' + JSON.stringify(srv.address()))
     return rc

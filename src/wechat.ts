@@ -10,8 +10,9 @@ import {
     GlobalAlloc, GlobalLock, GlobalUnlock, GlobalFree, RtlMoveMemory,
 } from 'quickwin/lib/windows/kernel32.js'
 import { RECT, POINT, INPUT } from 'quickwin/lib/windows/structs.js'
-import { closure } from 'quickwin/lib/ffi/bind.js'
+import { closure, WCHAR } from 'quickwin/lib/ffi/bind.js'
 import { captureWindow, cropBmp, bmpToBase64 } from './avatar.ts'
+import { log } from './log.ts'
 
 // 非阻塞等待（setTimeout 让出事件循环；os.sleep 会同步卡住 HTTP server，不能用）
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
@@ -285,8 +286,10 @@ function bgClickAt(win: MaybePtr<'HWND'>, sx: number, sy: number): void {
 
 /** 读窗口类名（UTF-16LE → string）。 */
 function windowClass(hwnd: MaybePtr<'HWND'>): string {
-    const buf = new PtrArrayBuffer(512)
-    const n = GetClassName(hwnd, buf, 256)
+    // GetClassName 出参是 <WCHAR>ptr，nMaxCount 单位 TCHAR：WCHAR.alloc(256) = 512B
+    // 与 nMaxCount=256 对齐（旧版传对象，改 <WCHAR>ptr 后强制 .ptr）。
+    const buf = WCHAR.alloc(256)
+    const n = GetClassName(hwnd, buf.ptr, 256)
     const dv = new DataView(buf)
     let s = ''
     for (let i = 0; i < n; i++) s += String.fromCharCode(dv.getUint16(i * 2, true))
@@ -328,13 +331,18 @@ async function setSearchBox(hwnd: MaybePtr<'HWND'>, value: string): Promise<bool
     if (!c) return false
     // 1) 取搜索框位置并点击聚焦
     const root0 = c.elementFromHandle(hwnd)
+    log('setSearchBox root0=' + (root0 ? 'ok' : 'null') + ' value=' + JSON.stringify(value))
     if (!root0) return false
     let boxRect: Rect | null = null
     try {
         const box = findFirst(root0, (el: UiaElement) => el.controlType() === 50004 && /搜索/i.test(el.name()))
-        if (!box) return false
+        if (!box) {
+            log('setSearchBox no searchbox (root0)')
+            return false
+        }
         boxRect = box.rect()
         box.release()
+        log('setSearchBox box0 ok rect=' + (boxRect ? Math.round(boxRect.left) + ',' + Math.round(boxRect.top) : 'null'))
     } finally {
         root0.release()
     }
@@ -346,12 +354,17 @@ async function setSearchBox(hwnd: MaybePtr<'HWND'>, value: string): Promise<bool
     }
     // 2) 重新取元素再 setValue（点击后 UIA 树可能重建，旧元素会失效）
     const root1 = c.elementFromHandle(hwnd)
+    log('setSearchBox root1=' + (root1 ? 'ok' : 'null') + ' value=' + JSON.stringify(value))
     if (!root1) return false
     try {
         const box = findFirst(root1, (el: UiaElement) => el.controlType() === 50004 && /搜索/i.test(el.name()))
-        if (!box) return false
+        if (!box) {
+            log('setSearchBox no searchbox (root1) value=' + JSON.stringify(value))
+            return false
+        }
         box.setValue(value)
         box.release()
+        log('setSearchBox value=' + JSON.stringify(value) + ' ok')
         return true
     } finally {
         root1.release()
@@ -413,27 +426,41 @@ export async function searchAndOpen(hwnd: MaybePtr<'HWND'>, session: string): Pr
         if (!root) continue
         let cellRect: Rect | null = null
         let sawPopover = false
+        let candidates: string[] = []
         try {
             const pop = findFirst(root, (el: UiaElement) => el.className() === 'mmui::SearchContentPopover')
             if (pop) { sawPopover = true; pop.release() }
             // 同名的可能有多个（聊天结果 + 网络结果）；聊天结果带头像更高，取最高者。
             // 只有达到 CHAT_RESULT_MIN_HEIGHT 的才算聊天结果。
+            // 不限 className：实测聊天结果可能是 XTableCell（功能）/ SearchContentCellView
+            // （群聊·联系人）/ SearchMessageCellView（聊天记录），单认 XTableCell 会漏。
             let bestH = -1
             for (const el of root.findAllWhere(TreeScope.Subtree, (el: UiaElement) =>
-                el.className() === 'mmui::XTableCell' && el.name().trim() === session)) {
+                el.name().trim() === session)) {
                 const rr = el.rect()
+                const cls = el.className()
                 el.release()
                 if (!rr) continue
                 const h = rr.bottom - rr.top
+                candidates.push(`${cls} top=${Math.round(rr.top)} h=${h}`)
                 if (h >= CHAT_RESULT_MIN_HEIGHT && h > bestH) { bestH = h; cellRect = rr }
             }
         } finally {
             root.release()
         }
+        log('searchAndOpen "' + session + '" attempt=' + attempt + ' popover=' + sawPopover +
+            ' name==session rows: [' + candidates.join(' | ') + ']')
         // 弹出层已渲染却没有匹配结果 → 目标不存在，重试无意义
-        if (!cellRect && sawPopover) { notFound = true; break }
+        if (!cellRect && sawPopover) {
+            log('searchAndOpen "' + session + '" attempt=' + attempt + ' popover no >=48h rows → not-found')
+            notFound = true; break
+        }
         if (cellRect) {
             const popHwnd = findPopoverHwnd(cellRect)
+            log('searchAndOpen "' + session + '" attempt=' + attempt + ' click popHwnd=' +
+                (popHwnd ? '0x' + Number(popHwnd).toString(16) : 'NULL') +
+                ' at ' + Math.round((cellRect.left + cellRect.right) / 2) + ',' +
+                Math.round((cellRect.top + cellRect.bottom) / 2))
             if (popHwnd) {
                 bgClickAt(popHwnd,
                     Math.round((cellRect.left + cellRect.right) / 2),
@@ -442,13 +469,18 @@ export async function searchAndOpen(hwnd: MaybePtr<'HWND'>, session: string): Pr
         }
         // 等会话真正打开（ChatInputField 出现且标题=目标）
         for (let w = 0; w < 4; w++) {
-            if (isSessionOpen(hwnd, session)) return 'opened'
+            if (isSessionOpen(hwnd, session)) {
+                log('searchAndOpen "' + session + '" opened (attempt ' + attempt + ')')
+                return 'opened'
+            }
             await delay(300)
         }
+        log('searchAndOpen "' + session + '" attempt=' + attempt + ' click no open → retry')
     }
     // 失败：清空搜索框并关掉弹出层（setValue('') + 点输入框；绝不发 Esc）
     await setSearchBox(hwnd, '')
     await dismissPopover(hwnd)
+    log('searchAndOpen "' + session + '" failed notFound=' + notFound)
     return notFound ? 'not-found' : 'failed'
 }
 
@@ -474,13 +506,21 @@ async function openSessionInList(hwnd: MaybePtr<'HWND'>, session: string): Promi
         } finally {
             root.release()
         }
-        if (!clicked) return false    // 列表里没有 → 搜索兜底
+        if (!clicked) {
+            log('openSessionInList "' + session + '" not in list (attempt ' + attempt + ')')
+            return false    // 列表里没有 → 搜索兜底
+        }
         // 等会话真正打开，未开则下一轮再点
         for (let w = 0; w < 4; w++) {
-            if (isSessionOpen(hwnd, session)) return true
+            if (isSessionOpen(hwnd, session)) {
+                log('openSessionInList "' + session + '" opened (attempt ' + attempt + ')')
+                return true
+            }
             await delay(400)
         }
+        log('openSessionInList "' + session + '" click no open, retry (attempt ' + attempt + ')')
     }
+    log('openSessionInList "' + session + '" failed after 3 attempts')
     return false
 }
 
@@ -655,8 +695,15 @@ export type ChatMessage = { direction: 'out' | 'in'; text: string; time: string 
 
 /** 打开会话（列表快路径 + 搜索兜底）；sendToSession / readMessages 共用。 */
 export async function openSession(hwnd: MaybePtr<'HWND'>, session: string): Promise<OpenResult> {
-    if (await openSessionInList(hwnd, session)) return 'opened'
-    return await searchAndOpen(hwnd, session)
+    log('openSession "' + session + '" start')
+    if (await openSessionInList(hwnd, session)) {
+        log('openSession "' + session + '" opened via list')
+        return 'opened'
+    }
+    log('openSession "' + session + '" list miss → search')
+    const r = await searchAndOpen(hwnd, session)
+    log('openSession "' + session + '" search → ' + r)
+    return r
 }
 
 /** 消息列表容器（RecyclerListView name="消息"）；调用方负责 release。找不到 → null。 */

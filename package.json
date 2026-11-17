@@ -10,7 +10,7 @@
   "dependencies": {
     "@quickwinlabs/uia": "^0.2.2",
     "fzstd": "^0.1.1",
-    "quickwin": "^3.4.3",
+    "quickwin": "^3.5.0",
     "react": "^19.2.0"
   },
   "devDependencies": {
