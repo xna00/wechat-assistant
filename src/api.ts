@@ -125,9 +125,12 @@ async function withUiLock<T>(fn: () => Promise<T>, timeoutMs = 60000): Promise<T
     }
 }
 
+/** 当前 API server 句柄（模块级：stopApiServer 需访问；托盘"重启"前先关旧实例释放端口）。 */
+let server: ReturnType<typeof createServer> | null = null
+
 /** 启动 API server（幂等：已监听则不重复）。返回监听结果（0=成功）。 */
 export function startApiServer(): number {
-    const server = createServer(async (req) => {
+    const srv = createServer(async (req) => {
         // 兜底：任何未捕获异常（含 withUiLock 超时）都转成 500 JSON，不让连接悬挂/断开
         try {
             return await handle(req)
@@ -237,9 +240,16 @@ export function startApiServer(): number {
         }
         return apiDoc({ request: { method: req.method, path } })
     }
-    const rc = server.listen(PORT, '127.0.0.1')
+    server = srv
+    const rc = srv.listen(PORT, '127.0.0.1')
     console.log('[api] /status /contacts /send /messages /messages/db at http://127.0.0.1:' + PORT +
         ' (other requests -> API doc) listen rc=' + rc +
-        ' addr=' + JSON.stringify(server.address()))
+        ' addr=' + JSON.stringify(srv.address()))
     return rc
+}
+
+/** 停止 API server：同步关闭监听 socket 释放端口（托盘"重启"前调用，让新实例可立即 bind）。 */
+export function stopApiServer(): void {
+    server?.close()
+    server = null
 }
