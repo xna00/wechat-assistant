@@ -44,8 +44,12 @@ const API_DOC = {
             description: '发送消息或文件：先按会话列表直接打开目标（快路径），不在列表则用顶部搜索兜底；选中会话后自动清理搜索态，再输入/粘贴并点发送。message 与 file 二选一。',
             body: {
                 session: '文件传输助手',
-                message: 'hello',                          // 与 file 互斥
-                file: 'C:\\path\\file.txt',                // 单个文件路径；一次只能发一个文件（不支持多文件）；图片→图片消息；与 message 互斥
+                message: 'hello',
+                file: 'C:\\path\\file.txt',
+            },
+            bodyNote: {
+                message: '与 file 互斥',
+                file: '一次只能发一个文件（不支持多文件）；图片→图片消息；与 message 互斥',
             },
             response: { ok: true },
             errors: [
