@@ -68,7 +68,8 @@ export function installTray(hwnd: gui.HWND) {
         const exe = readWStrBuf(buf)
         if (!exe) return
         // 先启动新实例，成功（>32）才关服务/退出；若启动失败则不动作（保服务、保窗口）。
-        const h = ShellExecute(NULL, 'open', exe, NULL, NULL, ShowWindowCmd.SHOW)
+        // 新实例带 --restart 参数 + SW_HIDE：启动后 noShowWindow 静默到托盘，不弹窗。
+        const h = ShellExecute(NULL, 'open', exe, '--restart', NULL, ShowWindowCmd.HIDE)
         if (!h || Number(h) <= 32) return
         stopApiServer()                                         // 同步释放 8123（新实例才能 bind）
         setTimeout(() => quit(), 800)                           // 旧实例稍后退出
