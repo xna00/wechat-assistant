@@ -45,7 +45,7 @@ const API_DOC = {
             body: {
                 session: '文件传输助手',
                 message: 'hello',                          // 与 file 互斥
-                file: 'C:\\path\\file.txt',                // 文件路径；图片→图片消息；与 message 互斥
+                file: 'C:\\path\\file.txt',                // 单个文件路径；一次只能发一个文件（不支持多文件）；图片→图片消息；与 message 互斥
             },
             response: { ok: true },
             errors: [
