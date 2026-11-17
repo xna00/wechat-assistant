@@ -1,4 +1,4 @@
-// 微信助手 HTTP API（quickwin HttpServer）。核心能力：/status —— 微信连接状态；/contacts —— 通讯录联系人；/send —— 发消息。
+// 微信助手 HTTP API（quickwin HttpServer）。核心能力：/status —— 微信连接状态；/contacts —— 通讯录联系人；/send —— 发消息/文件。
 // 自描述：其余任何请求返回 API 使用说明（见 API_DOC）。
 // 绑定 guest 本地 127.0.0.1:8123（VM 内部调用，不做宿主端口映射）。
 import { createServer } from 'quickwin/lib/http-server.js'
@@ -41,11 +41,16 @@ const API_DOC = {
         {
             method: 'POST',
             path: '/send',
-            description: '发送消息：先按会话列表直接打开目标（快路径），不在列表则用顶部搜索兜底；选中会话后自动清理搜索态，再输入并点发送',
-            body: { session: '文件传输助手', message: 'hello' },
+            description: '发送消息或文件：先按会话列表直接打开目标（快路径），不在列表则用顶部搜索兜底；选中会话后自动清理搜索态，再输入/粘贴并点发送。message 与 file 二选一。',
+            body: {
+                session: '文件传输助手',
+                message: 'hello',                          // 与 file 互斥
+                file: 'C:\\path\\file.txt',                // 文件路径；图片→图片消息；与 message 互斥
+            },
             response: { ok: true },
             errors: [
                 { status: 400, error: 'missing session/message' },
+                { status: 400, error: 'message and file are mutually exclusive' },
                 { status: 400, error: 'bad json' },
                 { status: 503, error: 'wechat not running' },
                 { status: 404, error: 'session not found' },
